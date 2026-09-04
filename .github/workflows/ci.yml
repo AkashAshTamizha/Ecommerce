@@ -38,7 +38,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          # actions/setup-node caches ~/.npm keyed on the lockfile hash below
           cache: "npm"
           cache-dependency-path: backend/package-lock.json
 
@@ -104,6 +103,8 @@ jobs:
           retention-days: 14
 
       - name: Build production bundle
+        env:
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api/v1' }}
         run: npm run build
 
       - name: Upload build artifact
