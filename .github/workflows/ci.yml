@@ -1,0 +1,131 @@
+name: CI
+
+# Runs on every push and pull request. This is the required status check
+# that the CD workflow waits on (see .github/workflows/cd.yml).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+# Cancel superseded runs on the same branch/PR to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22.x"
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Backend: lint -> test + coverage -> build
+  # ────────────────────────────────────────────────────────────────
+  backend:
+    name: Backend (lint, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # actions/setup-node caches ~/.npm keyed on the lockfile hash below
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run unit tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage
+          retention-days: 14
+
+      - name: Build
+        run: npm run build
+
+  # ────────────────────────────────────────────────────────────────
+  # Frontend: lint -> test + coverage -> build
+  # ────────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend (lint, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run unit tests with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage
+          retention-days: 14
+
+      - name: Build production bundle
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/.next
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────
+  # Single required status check for branch protection / CD gating.
+  # ────────────────────────────────────────────────────────────────
+  ci-success:
+    name: CI success
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    if: always()
+    steps:
+      - name: Fail if any job in the matrix failed
+        run: |
+          if [ "${{ needs.backend.result }}" != "success" ] || [ "${{ needs.frontend.result }}" != "success" ]; then
+            echo "One or more CI jobs failed: backend=${{ needs.backend.result }}, frontend=${{ needs.frontend.result }}"
+            exit 1
+          fi
+          echo "All CI jobs passed."

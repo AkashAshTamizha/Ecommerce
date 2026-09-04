@@ -1,0 +1,316 @@
+# name: CD
+
+# # Runs only after the CI workflow completes successfully on `main`.
+# # Using workflow_run (rather than push) guarantees CD can never deploy
+# # code that hasn't passed lint/test/build — even if someone re-triggers
+# # this workflow manually, the `if` check below still enforces it.
+# on:
+#   workflow_run:
+#     workflows: ["CI"]
+#     types: [completed]
+#     branches: [main]
+#   # Allows a manual re-run from the Actions tab (e.g. to redeploy after
+#   # fixing a deploy-time secret) without needing a new commit.
+#   workflow_dispatch:
+
+# concurrency:
+#   group: cd-production
+#   cancel-in-progress: false # never cancel a deploy mid-flight
+
+# permissions:
+#   contents: read
+
+# jobs:
+#   # ────────────────────────────────────────────────────────────────
+#   # Guard: only proceed if CI actually succeeded on main (or this was
+#   # triggered manually).
+#   # ────────────────────────────────────────────────────────────────
+#   gate:
+#     name: Verify CI succeeded
+#     runs-on: ubuntu-latest
+#     if: >
+#       github.event_name == 'workflow_dispatch' ||
+#       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+#     outputs:
+#       sha: ${{ steps.resolve-sha.outputs.sha }}
+#     steps:
+#       - id: resolve-sha
+#         run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+#   # ────────────────────────────────────────────────────────────────
+#   # Deploy backend to Render.
+#   # Render's deploy hook is a secret, single-purpose URL — treat it like
+#   # a credential (repo secret only, never logged, never in plain text).
+#   # ────────────────────────────────────────────────────────────────
+#   deploy-backend:
+#     name: Deploy backend (Render)
+#     needs: gate
+#     runs-on: ubuntu-latest
+#     environment: production
+#     steps:
+#       - name: Checkout (for commit SHA reference in logs)
+#         uses: actions/checkout@v4
+#         with:
+#           ref: ${{ needs.gate.outputs.sha }}
+
+#       - name: Trigger Render deploy hook
+#         env:
+#           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+#         run: |
+#           if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+#             echo "::error::RENDER_DEPLOY_HOOK_URL secret is not set. Add it in Settings > Secrets and variables > Actions."
+#             exit 1
+#           fi
+#           http_status=$(curl -s -o /tmp/render_response.json -w "%{http_code}" -X POST "$RENDER_DEPLOY_HOOK_URL")
+#           echo "Render responded with HTTP $http_status"
+#           cat /tmp/render_response.json
+#           if [ "$http_status" -ge 300 ]; then
+#             echo "::error::Render deploy hook returned HTTP $http_status"
+#             exit 1
+#           fi
+
+#       - name: Verify backend health after deploy
+#         env:
+#           BACKEND_HEALTH_URL: ${{ secrets.BACKEND_HEALTH_URL }}
+#         run: |
+#           if [ -z "$BACKEND_HEALTH_URL" ]; then
+#             echo "::warning::BACKEND_HEALTH_URL secret not set — skipping post-deploy health check."
+#             exit 0
+#           fi
+#           echo "Waiting for Render to roll out the new deploy..."
+#           for i in $(seq 1 10); do
+#             sleep 15
+#             status=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_HEALTH_URL" || echo "000")
+#             echo "Attempt $i: HTTP $status"
+#             if [ "$status" = "200" ]; then
+#               echo "Backend is healthy."
+#               exit 0
+#             fi
+#           done
+#           echo "::error::Backend did not report healthy after deploy. Check the Render dashboard and consider rolling back (see README > Rollback)."
+#           exit 1
+
+#   # ────────────────────────────────────────────────────────────────
+#   # Deploy frontend to Vercel using the official CLI in "prebuilt" mode
+#   # so the same build config Vercel would use stays declarative and
+#   # inspectable in this repo.
+#   # ────────────────────────────────────────────────────────────────
+#   deploy-frontend:
+#     name: Deploy frontend (Vercel)
+#     needs: gate
+#     runs-on: ubuntu-latest
+#     environment: production
+#     defaults:
+#       run:
+#         working-directory: frontend
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v4
+#         with:
+#           ref: ${{ needs.gate.outputs.sha }}
+
+#       - name: Install Vercel CLI
+#         run: npm install --global vercel@latest
+
+#       - name: Pull Vercel project settings
+#         env:
+#           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+#           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+#           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+#         run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+#       - name: Build for production via Vercel
+#         env:
+#           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+#           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+#           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+#         run: vercel build --prod --token="$VERCEL_TOKEN"
+
+#       - name: Deploy prebuilt output to Vercel
+#         env:
+#           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+#           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+#           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+#         run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+
+#   # ────────────────────────────────────────────────────────────────
+#   # Rollback recommendations (documentation only — rollback is a
+#   # deliberate human decision, not something to automate blindly).
+#   #
+#   # Backend (Render):
+#   #   1. Render dashboard > your service > Events/Deploys tab.
+#   #   2. Find the last known-good deploy and click "Rollback to this
+#   #      deploy" (Render keeps prior immutable build artifacts).
+#   #   3. Alternatively, `git revert` the bad commit on `main` and let
+#   #      CI/CD redeploy — safer for audit history than a dashboard click.
+#   #
+#   # Frontend (Vercel):
+#   #   1. Vercel dashboard > project > Deployments.
+#   #   2. Every deployment is immutable and individually addressable —
+#   #      select the last good one and choose "Promote to Production"
+#   #      (instant, no rebuild required).
+#   #   3. Or via CLI: `vercel rollback <deployment-url> --token=$VERCEL_TOKEN`.
+#   #
+#   # In both cases, re-run the "Verify backend health" style check (or
+#   # load the site) after rolling back to confirm recovery.
+#   # ────────────────────────────────────────────────────────────────
+name: CD
+
+# Runs only after the CI workflow completes successfully on `main`.
+# Using workflow_run (rather than push) guarantees CD can never deploy
+# code that hasn't passed lint/test/build — even if someone re-triggers
+# this workflow manually, the `if` check below still enforces it.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # Allows a manual re-run from the Actions tab (e.g. to redeploy after
+  # fixing a deploy-time secret) without needing a new commit.
+  workflow_dispatch:
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false # never cancel a deploy mid-flight
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Guard: only proceed if CI actually succeeded on main (or this was
+  # triggered manually).
+  # ────────────────────────────────────────────────────────────────
+  gate:
+    name: Verify CI succeeded
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+    outputs:
+      sha: ${{ steps.resolve-sha.outputs.sha }}
+    steps:
+      - id: resolve-sha
+        run: echo "sha=${{ github.event.workflow_run.head_sha || github.sha }}" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────
+  # Deploy backend to Render.
+  # Render's deploy hook is a secret, single-purpose URL — treat it like
+  # a credential (repo secret only, never logged, never in plain text).
+  # ────────────────────────────────────────────────────────────────
+  deploy-backend:
+    name: Deploy backend (Render)
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout (for commit SHA reference in logs)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Trigger Render deploy hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK_URL secret is not set. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          http_status=$(curl -s -o /tmp/render_response.json -w "%{http_code}" -X POST "$RENDER_DEPLOY_HOOK_URL")
+          echo "Render responded with HTTP $http_status"
+          cat /tmp/render_response.json
+          if [ "$http_status" -ge 300 ]; then
+            echo "::error::Render deploy hook returned HTTP $http_status"
+            exit 1
+          fi
+
+      - name: Verify backend health after deploy
+        env:
+          BACKEND_HEALTH_URL: ${{ secrets.BACKEND_HEALTH_URL }}
+        run: |
+          if [ -z "$BACKEND_HEALTH_URL" ]; then
+            echo "::warning::BACKEND_HEALTH_URL secret not set — skipping post-deploy health check."
+            exit 0
+          fi
+          echo "Waiting for Render to roll out the new deploy..."
+          for i in $(seq 1 10); do
+            sleep 15
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_HEALTH_URL" || echo "000")
+            echo "Attempt $i: HTTP $status"
+            if [ "$status" = "200" ]; then
+              echo "Backend is healthy."
+              exit 0
+            fi
+          done
+          echo "::error::Backend did not report healthy after deploy. Check the Render dashboard and consider rolling back (see README > Rollback)."
+          exit 1
+
+  # ────────────────────────────────────────────────────────────────
+  # Deploy frontend to Vercel using the official CLI in "prebuilt" mode
+  # so the same build config Vercel would use stays declarative and
+  # inspectable in this repo.
+  #
+  # No working-directory here on purpose: Root Directory = "frontend" is
+  # configured on the Vercel project itself. `vercel pull` downloads that
+  # setting into .vercel/project.json at the repo root, and the CLI applies
+  # it automatically when building/deploying. If this job also cd's into
+  # frontend/, the CLI concatenates the two paths and looks for
+  # frontend/frontend, which throws "Error: spawn sh ENOENT".
+  # ────────────────────────────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy frontend (Vercel)
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN" --debug
+
+      - name: Build for production via Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy prebuilt output to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+
+  # ────────────────────────────────────────────────────────────────
+  # Rollback recommendations (documentation only — rollback is a
+  # deliberate human decision, not something to automate blindly).
+  #
+  # Backend (Render):
+  #   1. Render dashboard > your service > Events/Deploys tab.
+  #   2. Find the last known-good deploy and click "Rollback to this
+  #      deploy" (Render keeps prior immutable build artifacts).
+  #   3. Alternatively, `git revert` the bad commit on `main` and let
+  #      CI/CD redeploy — safer for audit history than a dashboard click.
+  #
+  # Frontend (Vercel):
+  #   1. Vercel dashboard > project > Deployments.
+  #   2. Every deployment is immutable and individually addressable —
+  #      select the last good one and choose "Promote to Production"
+  #      (instant, no rebuild required).
+  #   3. Or via CLI: `vercel rollback <deployment-url> --token=$VERCEL_TOKEN`.
+  #
+  # In both cases, re-run the "Verify backend health" style check (or
+  # load the site) after rolling back to confirm recovery.
+  # ────────────────────────────────────────────────────────────────
