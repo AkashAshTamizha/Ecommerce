@@ -19,6 +19,7 @@ async function main() {
       emailVerified: true,
     },
   });
+  
   console.log(`✅ Super Admin: admin@ecomxc.com / Admin@12345`);
 
   // ---- Categories ----
